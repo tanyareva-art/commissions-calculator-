@@ -1,91 +1,138 @@
-import React, { createContext, useContext, useReducer, useEffect } from 'react'
-import { genId, calcPolicyBonus, calcRenewalRate, getEmployeeBonusRate } from '../utils/calculations'
+import React, { createContext, useContext, useReducer } from 'react'
+import {
+  genId,
+  calcPolicyBonus,
+  calcRenewalRate,
+  getEmployeeBonusRate,
+  calcEndorsementAdjustment,
+  GREAT_WEST_CARRIER,
+  BONUS_RATE_GW,
+} from '../utils/calculations'
 
-const STORAGE_KEY = 'commissions_app_v1'
+const STORAGE_KEY = 'commissions_app_v2'
 
 // ─── Initial State ────────────────────────────────────────────────────────────
+
 const initialState = {
-  employees: [],
-  policies: [],
+  employees:    [],
+  policies:     [],
+  endorsements: [],
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// ─── Persistence ─────────────────────────────────────────────────────────────
+
 function loadState() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY)
-    return raw ? JSON.parse(raw) : initialState
+    if (raw) return JSON.parse(raw)
+    // Migrate from v1 if present
+    const v1 = localStorage.getItem('commissions_app_v1')
+    if (v1) {
+      const parsed = JSON.parse(v1)
+      return { ...initialState, employees: parsed.employees ?? [], policies: parsed.policies ?? [] }
+    }
+    return initialState
   } catch {
     return initialState
   }
 }
 
 function saveState(state) {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(state))
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)) } catch { /* storage full */ }
 }
 
+// ─── Bonus Recalculation ──────────────────────────────────────────────────────
+
 /**
- * Recalculates bonus for every policy that has been renewed (firstPaymentDate set).
- * Needs to run after any policy or employee change that affects renewal rates.
+ * Recomputes bonusAmount, adjustmentTotal, netBonus, and clawbackAmount
+ * for every policy whenever state changes.
  */
 function recalcBonuses(state) {
-  const { employees, policies } = state
+  const { employees, policies, endorsements } = state
 
-  // For each employee, compute their bonus rate
-  const employeeBonusRates = {}
+  // Step 1: compute each employee's bonus rate from their renewal rate
+  const empRates = {}
   employees.forEach(emp => {
     const { rate } = calcRenewalRate(policies, emp.id)
-    employeeBonusRates[emp.id] = getEmployeeBonusRate(rate)
+    empRates[emp.id] = getEmployeeBonusRate(rate)
   })
 
+  // Step 2: recompute per-policy bonus fields
   const updatedPolicies = policies.map(p => {
-    if (!p.firstPaymentDate) return { ...p, bonusAmount: null, bonusRate: null }
-    const empRate = employeeBonusRates[p.employeeId] ?? 0.08
-    const bonusAmount = calcPolicyBonus(p, empRate)
-    const bonusRate   = p.carrier === 'Great West' ? 0.02 : empRate
-    return { ...p, bonusAmount, bonusRate }
+    // No bonus until first payment received
+    if (!p.firstPaymentDate) {
+      return { ...p, bonusAmount: null, bonusRate: null, adjustmentTotal: null, netBonus: null, clawbackAmount: p.status === 'cancelled' ? 0 : null }
+    }
+
+    const empRate    = empRates[p.employeeId] ?? 0.08
+    const bonusRate  = p.carrier === GREAT_WEST_CARRIER ? BONUS_RATE_GW : empRate
+    const baseBonus  = calcPolicyBonus(p, empRate)
+
+    // Sum endorsement adjustments for this policy
+    const policyEndorsements = endorsements.filter(e => e.policyId === p.id)
+    const adjustments        = policyEndorsements.map(e => calcEndorsementAdjustment(p, e, empRate))
+    const adjustmentTotal    = adjustments.reduce((sum, a) => sum + a.adjustment, 0)
+    const netBonus           = baseBonus + adjustmentTotal
+
+    // Recalculate clawback on NET bonus for cancelled policies
+    let clawbackAmount = p.clawbackAmount ?? null
+    if (p.status === 'cancelled' && p.cancellationDate) {
+      const totalDays     = Math.max(1, Math.round((new Date(p.expirationDate) - new Date(p.effectiveDate)) / 86400000))
+      const daysElapsed   = Math.max(0, Math.round((new Date(p.cancellationDate) - new Date(p.effectiveDate)) / 86400000))
+      const daysRemaining = Math.max(0, totalDays - daysElapsed)
+      clawbackAmount      = netBonus * (daysRemaining / totalDays)
+    }
+
+    return { ...p, bonusAmount: baseBonus, bonusRate, adjustmentTotal, netBonus, clawbackAmount }
   })
 
   return { ...state, policies: updatedPolicies }
 }
 
-// ─── Reducer ──────────────────────────────────────────────────────────────────
+// ─── Reducer ─────────────────────────────────────────────────────────────────
+
 function reducer(state, action) {
   let next = state
 
   switch (action.type) {
-    // Employees
+
+    // ── Employees ──────────────────────────────────────────────────────────
     case 'ADD_EMPLOYEE': {
       const employee = { id: genId(), createdAt: new Date().toISOString(), ...action.payload }
       next = { ...state, employees: [...state.employees, employee] }
       break
     }
     case 'UPDATE_EMPLOYEE': {
-      next = {
-        ...state,
-        employees: state.employees.map(e => e.id === action.payload.id ? { ...e, ...action.payload } : e),
-      }
+      next = { ...state, employees: state.employees.map(e => e.id === action.payload.id ? { ...e, ...action.payload } : e) }
       break
     }
     case 'DELETE_EMPLOYEE': {
+      const empId = action.payload
       next = {
         ...state,
-        employees: state.employees.filter(e => e.id !== action.payload),
-        policies: state.policies.filter(p => p.employeeId !== action.payload),
+        employees:    state.employees.filter(e => e.id !== empId),
+        policies:     state.policies.filter(p => p.employeeId !== empId),
+        endorsements: state.endorsements.filter(e => {
+          const pol = state.policies.find(p => p.id === e.policyId)
+          return pol?.employeeId !== empId
+        }),
       }
       break
     }
 
-    // Policies
+    // ── Policies ───────────────────────────────────────────────────────────
     case 'ADD_POLICY': {
       const policy = {
         id: genId(),
         createdAt: new Date().toISOString(),
         firstPaymentDate: null,
         cancellationDate: null,
-        renewalPremium: null,
-        bonusAmount: null,
-        bonusRate: null,
-        clawbackAmount: null,
+        renewalPremium:   null,
+        bonusAmount:      null,
+        bonusRate:        null,
+        adjustmentTotal:  null,
+        netBonus:         null,
+        clawbackAmount:   null,
         notes: '',
         ...action.payload,
       }
@@ -93,18 +140,19 @@ function reducer(state, action) {
       break
     }
     case 'UPDATE_POLICY': {
-      next = {
-        ...state,
-        policies: state.policies.map(p => p.id === action.payload.id ? { ...p, ...action.payload } : p),
-      }
+      next = { ...state, policies: state.policies.map(p => p.id === action.payload.id ? { ...p, ...action.payload } : p) }
       break
     }
     case 'DELETE_POLICY': {
-      next = { ...state, policies: state.policies.filter(p => p.id !== action.payload) }
+      next = {
+        ...state,
+        policies:     state.policies.filter(p => p.id !== action.payload),
+        endorsements: state.endorsements.filter(e => e.policyId !== action.payload),
+      }
       break
     }
 
-    // Mark renewed (first payment received)
+    // ── Mark Renewed (first payment received) ─────────────────────────────
     case 'MARK_RENEWED': {
       const { policyId, firstPaymentDate, renewalPremium } = action.payload
       next = {
@@ -118,33 +166,66 @@ function reducer(state, action) {
       break
     }
 
-    // Update premium after renewal (recalculates bonus)
+    // ── Update Renewal Premium (correction, not endorsement) ──────────────
     case 'UPDATE_RENEWAL_PREMIUM': {
-      const { policyId, renewalPremium } = action.payload
       next = {
         ...state,
         policies: state.policies.map(p =>
-          p.id === policyId ? { ...p, renewalPremium } : p
+          p.id === action.payload.policyId ? { ...p, renewalPremium: action.payload.renewalPremium } : p
         ),
       }
       break
     }
 
-    // Mark cancelled — stores clawback amount
+    // ── Endorsements ──────────────────────────────────────────────────────
+    case 'ADD_ENDORSEMENT': {
+      const { policyId, endorsementDate, newPremium, notes } = action.payload
+
+      // Determine previousPremium from the endorsement chain
+      const existing = state.endorsements
+        .filter(e => e.policyId === policyId)
+        .sort((a, b) => new Date(a.endorsementDate) - new Date(b.endorsementDate))
+
+      const policy          = state.policies.find(p => p.id === policyId)
+      const previousPremium = existing.length > 0
+        ? existing[existing.length - 1].newPremium
+        : (policy?.renewalPremium ?? policy?.premium ?? 0)
+
+      const premiumChange = newPremium - previousPremium
+
+      const endorsement = {
+        id:       genId(),
+        createdAt: new Date().toISOString(),
+        policyId,
+        endorsementDate,
+        previousPremium,
+        newPremium,
+        premiumChange,
+        type:  premiumChange >= 0 ? 'increase' : 'decrease',
+        notes: notes ?? '',
+      }
+      next = { ...state, endorsements: [...state.endorsements, endorsement] }
+      break
+    }
+
+    case 'DELETE_ENDORSEMENT': {
+      next = { ...state, endorsements: state.endorsements.filter(e => e.id !== action.payload) }
+      break
+    }
+
+    // ── Mark Cancelled ────────────────────────────────────────────────────
     case 'MARK_CANCELLED': {
-      const { policyId, cancellationDate, clawbackAmount } = action.payload
+      const { policyId, cancellationDate } = action.payload
       next = {
         ...state,
         policies: state.policies.map(p =>
-          p.id === policyId
-            ? { ...p, status: 'cancelled', cancellationDate, clawbackAmount }
-            : p
+          p.id === policyId ? { ...p, status: 'cancelled', cancellationDate } : p
         ),
       }
       break
     }
 
-    // Undo cancellation
+    // ── Reinstate Policy ──────────────────────────────────────────────────
     case 'REINSTATE_POLICY': {
       next = {
         ...state,
@@ -157,30 +238,23 @@ function reducer(state, action) {
       break
     }
 
-    // Mark lost (came up for renewal but not renewed)
+    // ── Mark Lost ─────────────────────────────────────────────────────────
     case 'MARK_LOST': {
-      next = {
-        ...state,
-        policies: state.policies.map(p =>
-          p.id === action.payload ? { ...p, status: 'lost' } : p
-        ),
-      }
+      next = { ...state, policies: state.policies.map(p => p.id === action.payload ? { ...p, status: 'lost' } : p) }
       break
     }
-
-    case 'LOAD_STATE':
-      return action.payload
 
     default:
       return state
   }
 
-  const withBonuses = recalcBonuses(next)
-  saveState(withBonuses)
-  return withBonuses
+  const result = recalcBonuses(next)
+  saveState(result)
+  return result
 }
 
 // ─── Context ──────────────────────────────────────────────────────────────────
+
 const AppContext = createContext(null)
 
 export function AppProvider({ children }) {
@@ -189,12 +263,13 @@ export function AppProvider({ children }) {
     return recalcBonuses(loaded)
   })
 
-  // Expose helpers
-  const getEmployee = id => state.employees.find(e => e.id === id)
+  const getEmployee         = id => state.employees.find(e => e.id === id)
   const getEmployeePolicies = id => state.policies.filter(p => p.employeeId === id)
+  const getPolicyEndorsements = policyId => state.endorsements.filter(e => e.policyId === policyId)
+    .sort((a, b) => new Date(a.endorsementDate) - new Date(b.endorsementDate))
 
   return (
-    <AppContext.Provider value={{ state, dispatch, getEmployee, getEmployeePolicies }}>
+    <AppContext.Provider value={{ state, dispatch, getEmployee, getEmployeePolicies, getPolicyEndorsements }}>
       {children}
     </AppContext.Provider>
   )
